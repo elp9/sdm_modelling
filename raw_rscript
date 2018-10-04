@@ -1,0 +1,154 @@
+#Step by step tutorial for SDM in R using dismo package
+
+# preamble
+library(dismo)
+library(maptools)
+library(raster)
+
+setwd("~/Documents/Amblyomma_niche_modelling/maxent_in_R/") #change this
+
+# read and format data
+amblyomma<-read.csv("aamericanum_core_estab_lat_long.csv")
+amblyomma <- amblyomma[,2:3]
+
+
+# FYI: you can dowload GBIF records in R!
+agbif = gbif("amblyomma", "americanum*", geo=FALSE)
+# select only records with coordinates, 429 not bad!
+agbif_geo <- subset(agbif, !is.na(lon) & !is.na(lat))
+# compare GBIF data with your dataset
+data(wrld_simpl)
+png("gbif_amblyomma.png")
+raster::plot(wrld_simpl, xlim=c(-120,-70), ylim=c(20,60), axes=TRUE, col="light yellow")
+# restore the box around the map
+box()
+#GBIF
+# plot points
+points(agbif_geo$lon, agbif_geo$lat, col='orange', pch=20, cex=0.75)
+# plot points again to add a border, for better visibility
+points(agbif_geo$lon, agbif_geo$lat, col='red', cex=0.75)
+#Your data
+points(amblyomma$lon, amblyomma$lat, col='green', pch=20, cex=0.75)
+# plot points again to add a border, for better visibility
+points(amblyomma$lon, amblyomma$lat, col='blue', cex=0.75)
+dev.off()
+##############################################
+
+# environmental data (Chapter 4): you can dowload worldclim and elevation in R
+# dowlnoad bioclim for all USA in three parts and then patch them (takes time)
+bioclim.1 <- getData("worldclim",var="bio", res=0.5, lon=-80, lat=36)
+bioclim.2 <- getData("worldclim",var="bio", res=0.5, lon=-110, lat=38)
+bioclim.3 <- getData("worldclim",var="bio", res=0.5, lon=-130, lat=38)
+bioclim<-merge(bioclim.1,bioclim.2,bioclim.3)
+# alternative for testing, download the slightest lower resolution to speed up
+bioclim <- getData("worldclim",var="bio", res=2.5)
+raster::plot(bioclim)
+# cut on study area
+bioclim.st<-crop(bioclim, extent(bbox(matrix(c(-59,-127,49,22),nrow=2,ncol=2))))
+raster::plot(bioclim.usa)
+# dowload elevation, are you sure? temperature correlates with elevation. I am downloading it but for now I will use just the 18 Bioclim variables as predictors in the model.
+elevation.1 <- getData("alt",country=c("USA"))
+elevation.2 <- getData("alt",country=c("Mexico"))
+elevation.3 <- getData("alt",country=c("Canada"))
+elevation<-merge(elevation.1[[1]],elevation.2,elevation.3)
+# cut on same areas as bioclim
+elevation.st<-crop(elevation, extent(bbox(matrix(c(-59,-127,49,22),nrow=2,ncol=2))))
+rplot(elevation.st)
+
+#Extract values from raster (Chapter 4.2)
+bio.presvals <- extract(bioclim.st, amblyomma)
+ele.presvals <- extract(elevation.st, amblyomma)
+presvals<-cbind.data.frame(bio.presvals,ele=ele.presvals)
+
+# select background ("absence") (Chapter 3)
+# Here I'm taking absence points only from areas where the average temperature is less than 9C
+#Select this area
+meant10 <- reclassify(bioclim.st[[1]], cbind(90, Inf, NA), right=FALSE)
+#xtract 200 random points from this raster
+set.seed(1987)
+bg <- randomPoints(meant10, 200 )
+#Plot presence and pseudoabsence
+rplot(bioclim.st[[1]])
+points(amblyomma,col="blue")
+points(bg,col="red")
+# extract predictors for absence points
+bio.absvals <- extract(bioclim.st, bg)
+ele.absvals <- extract(elevation.st, bg)
+absvals<-cbind.data.frame(bio.absvals,ele=ele.absvals)
+#merge them in an unique dataframe
+pb <- c(rep(1, nrow(presvals)), rep(0, nrow(bg)))
+sdmdata <- data.frame(cbind(pb, rbind(presvals, absvals)))
+# use scatterplot to see how they look like
+pairs(sdmdata[,2:5], cex=1, pch=16,fig=TRUE,col=ifelse(sdmdata$pb==1,"red","blue"))
+
+# prepare for model prediction (chapter 6): read chapter 9 for all the modelling methods dismo packages implements
+# make a train and test set for both presence and absence
+group <- kfold(amblyomma, 5)
+pres_train <- amblyomma[group != 1, ]
+pres_test <- amblyomma[group == 1, ]
+group <- kfold(bg, 5)
+abs_train <- bg[group != 1, ]
+abs_test <- bg[group == 1, ] 
+# for testing I am restrinting the prediction to a small part of california
+#ext = extent(-123, -100, 32, 45)
+# look at what all this means
+r = raster(bioclim.st, 1)
+rplot(!is.na(r), col=c('white', 'light grey'), legend=FALSE)
+rplot(ext, add=TRUE, col='red', lwd=2)
+points(abs_train, pch='-', cex=3, col='yellow')
+points(abs_test, pch='-', cex=3, col='black')
+points(pres_train, pch= '+', col='green')
+points(pres_test, pch='+', col='blue')
+
+#bioclim model (chapter 9): read the chapter to understand what is this, I have no idea. Seems to perform not very well, but remember the absence data are taken rather randomly
+bc <- bioclim(bioclim.st, pres_train)
+e <- evaluate(pres_test, abs_test, bc, bioclim.st)
+tr <- threshold(e, 'spec_sens')
+pb <- predict(bioclim.st, bc, progress='')
+
+par(mfrow=c(1,2))
+rplot(pb, main='Bioclim, raw values')
+rplot(wrld_simpl, add=TRUE, border='dark grey')
+rplot(pb > tr, main='presence/absence')
+rplot(wrld_simpl, add=TRUE, border='dark grey')
+points(pres_train, pch='+')
+
+#MaxEnt model (Chapter 11.1). i) you need to install rJava R package, which can be a pain in the ass, teh series of if condition in teh following lines keep on failing till when you don't have all the java file in the right place. ii) follow instruction in Chapter 11.1 for maxent, you need to move some files in the right location.
+#make a varaible contribution model, Bio1 seems to be the best contributor
+jar <- paste(system.file(package="dismo"), "/java/maxent.jar", sep='')
+if (file.exists(jar)) {
+	xm <- maxent(bioclim.st, pres_train)
+	rplot(xm)
+} else {
+	cat('cannot run this example because maxent is not available')
+	plot(1)
+}
+# run the MaxEnt model
+if (file.exists(jar)) {
+	e <- evaluate(pres_test, abs_test, xm, bioclim.st)
+	e
+	px <- predict(bioclim.st, xm, progress='')
+	par(mfrow=c(1,2))
+	rplot(px, main='Maxent, raw values')
+	rplot(wrld_simpl, add=TRUE, border='dark grey')
+	tr <- threshold(e, 'spec_sens')
+	rplot(px > tr, main='presence/absence')
+	rplot(wrld_simpl, add=TRUE, border='dark grey')
+	points(pres_train, pch='+')
+} else {
+	rplot(1)
+}
+#run to see the performance of your model
+xm
+
+png("Maxent_test_prediction.png",width=480*2,height=480*2)
+	par(mfrow=c(1,2))
+	rplot(px, main='Maxent, raw values')
+	rplot(wrld_simpl, add=TRUE, border='dark grey')
+	rplot(px > tr, main='presence/absence')
+	rplot(wrld_simpl, add=TRUE, border='dark grey')
+	points(pres_train, pch='+')
+dev.off()
+#Now you have to study maxent manuals and the maxent function in R to tune your model
+
+#Other models?
